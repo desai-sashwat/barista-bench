@@ -1,0 +1,8 @@
+google-genai>=1.0.0
+kaggle
+
+protobuf
+pandas
+tqdm
+numpy
+openai

@@ -1,0 +1,379 @@
+Barista Bench Notebook – Code Walkthrough
+========================================
+
+Overview
+--------
+This notebook builds an end-to-end pipeline that takes natural language coffee shop orders,
+parses them using a large language model (LLM), and produces structured JSON suitable for a
+point-of-sale (POS) system. It also recomputes prices deterministically from a hand-coded
+menu, validates that pricing logic against the training labels, runs the model on the test
+set, creates a competition submission file, and performs a few quality checks.
+
+The high-level stages are:
+1. Load training and test data.
+2. Define menu/pricing rules and helper functions.
+3. Construct a detailed system prompt with few-shot examples.
+4. Configure the LLM provider (OpenAI or Gemini) and wrap calls.
+5. Parse every test order with retries, merging duplicate items and forcing prices from rules.
+6. Save predictions to CSV as a submission.
+7. Run sanity checks and offline validation against training data.
+
+Below is a cell-by-cell explanation matching `barista_bench_updated.ipynb`.
+
+
+Cell 0–1: Title and section header
+----------------------------------
+Markdown cells that provide a title for the notebook ("Barista Bench – The Reasoning Challenge")
+and a header for the first section (Imports). They are purely for documentation/structure.
+
+
+Cell 2: Imports
+---------------
+Code:
+- Imports standard libraries:
+  - `os` and `time` for basic OS operations and sleeping between API calls.
+  - `json` for parsing and serializing JSON.
+- Imports third-party libraries:
+  - `pandas as pd` for reading CSVs and manipulating tabular data.
+  - `from google import genai` – the new Google GenAI Python SDK used to talk to Gemini models.
+  - `from openai import OpenAI` – the OpenAI client for Chat Completions.
+  - `from tqdm import tqdm` – to display progress bars when looping over many orders.
+
+Purpose:
+This cell sets up all core dependencies for data loading, LLM calls, and progress tracking.
+
+
+Cell 3–4: Load Data
+-------------------
+Markdown (`### 2. Load Data`) introduces the section.
+
+Code:
+- `train_df = pd.read_csv('train.csv')`
+- `test_df = pd.read_csv('test.csv')`
+- Prints the shapes of both dataframes.
+
+What the data contains:
+- `train_df` has labeled examples with at least columns:
+  - `order`: the natural language order text.
+  - `expected_json`: the ground-truth JSON representation of that order.
+- `test_df` has competition test rows with:
+  - `id`: identifier for each order.
+  - `order`: the natural language order text, without labels.
+
+Purpose:
+Load both training and test data into memory and perform a quick sanity check on sizes so we
+know the files are read correctly.
+
+
+Cell 5–6: API Keys
+------------------
+Markdown (`### 3. API Keys`) introduces the section.
+
+Code:
+- Defines two string variables:
+  - `GEMINI_KEY` – API key for Google Gemini.
+  - `OPENAI_KEY` – API key for OpenAI.
+- A comment notes that in a real system these should come from environment variables or a
+  secrets manager rather than being hardcoded.
+
+Purpose:
+Provide credentials for the LLM providers so that the rest of the notebook can authenticate
+requests. In practice, you would replace these literals with secure key loading.
+
+
+Cell 7–8: Menu Data and Price Helpers
+-------------------------------------
+Markdown (`### 4. Menu Data For Price Validator`) introduces the section.
+
+Code:
+1. `BASE_PRICES` – dictionary mapping each drink/food item to its base price (usually the
+   Tall size for drinks, or a single price for food like pastries and sandwiches).
+
+2. `SIZE_ADJ` – dictionary for size-based price adjustments:
+   - `Short`: −$0.50
+   - `Tall`: $0.00
+   - `Grande`: +$0.50
+   - `Venti`: +$1.00
+   - `Trenta`: +$1.50
+
+3. `MOD_COSTS` – dictionary of per-modifier price deltas, for example:
+   - Milks like `"Oat Milk"`, `"Almond Milk"`.
+   - Syrups like `"Vanilla Syrup"`, `"Caramel Syrup"`.
+   - Toppings like `"Extra Shot"`, `"Cold Foam"`, `"Caramel Drizzle"`.
+   - Some modifiers have $0.00 effect, e.g. `"No Whip"`, `"Extra Hot"`, `"No Ice"`.
+
+4. `FOOD_ITEMS` – a set of food items that do not take drink sizes or drink-style modifiers.
+   For these, `size` should be `null` in JSON, and modifiers are typically empty.
+
+5. Function `fix_price(parsed)`:
+   - Input: a `parsed` dict with structure:
+     - `{"items": [...], "total_price": ...}`.
+   - For each item in `parsed["items"]`:
+     - Reads `name`, `size`, `quantity`, and `modifiers`.
+     - Looks up `base` price from `BASE_PRICES`.
+     - Computes `s`, the size adjustment, only if the item is not in `FOOD_ITEMS` and `size`
+       is present.
+     - Computes `m`, the sum of modifier costs from `MOD_COSTS`.
+     - Adds `(base + s + m) * quantity` to a running `total`.
+   - Sets `parsed["total_price"] = round(total, 2)`.
+   - Wraps the calculation in a `try/except` block to log any unexpected issues without
+     crashing the notebook.
+   - Purpose: override all LLM-computed prices and recompute them deterministically from menu
+     rules so you’re never trusting the model’s arithmetic.
+
+6. Function `merge_items(parsed)`:
+   - Merges duplicate items within `parsed["items"]` that have the same name, size, and set
+     of modifiers.
+   - Builds a dictionary `merged` keyed by
+     `(name, size, tuple(sorted(modifiers)))`.
+     - If a key already exists, it increments the existing `quantity`.
+     - Otherwise, it creates a new entry.
+   - Replaces `parsed["items"]` with `list(merged.values())`.
+   - Purpose: if the LLM emits multiple identical items instead of one item with a higher
+     `quantity`, this function normalizes them into a canonical representation.
+
+
+Cell 9–10: Validate Price Logic Against Training Labels
+-------------------------------------------------------
+Markdown (`### 5. Verify Price Validator Against Training Data`) introduces the section.
+
+Code:
+- Initializes counters `correct = 0`, `wrong = 0`.
+- Iterates over each row in `train_df`:
+  - Parses `expected_json` from the dataset into `exp`.
+  - Deep-copies `exp` via `json.dumps`/`json.loads` to avoid mutating the original.
+  - Calls `fix_price` on the copy, yielding `recalc`.
+  - Compares `recalc['total_price']` with the label `exp['total_price']` within 1 cent.
+  - If they match, increments `correct`; otherwise increments `wrong` and prints up to 3
+    mismatches for inspection.
+- Ignores (via bare `except`) any malformed rows, to avoid breaking the notebook.
+- Prints an overall accuracy percentage for the price validator.
+
+Purpose:
+To ensure that your `fix_price` function exactly reproduces the dataset’s labeled prices.
+Once this passes at ~100%, you can safely apply `fix_price` to LLM outputs.
+
+
+Cell 11–12: System Prompt and Few-Shot Examples
+----------------------------------------------
+Markdown (`### 6. System Prompt`) introduces the section.
+
+Code:
+1. Builds `examples` string:
+   - Samples 8 random rows from `train_df` (fixed `random_state=42`).
+   - For each, appends an `Example i` block consisting of:
+     - The natural-language `order`.
+     - The corresponding `expected_json`.
+   - These examples will be appended to the end of the system prompt.
+
+2. Defines `cancellation_examples` string:
+   - Contains 4 explicit examples (9–12) covering:
+     - Cancelling an item from an order.
+     - Cancelling a modifier.
+     - Correcting quantities (e.g., "two" → "three").
+     - Multi-item orders with a later cancellation.
+   - Note: this string is **not** currently concatenated into `SYSTEM_PROMPT` but can serve as
+     additional documentation or for later prompt experiments.
+
+3. Defines `SYSTEM_PROMPT` (multi-line string):
+   - Describes the role: a coffee shop POS parser.
+   - Lists the full menu with base prices.
+   - Describes the size system and modifier rules.
+   - Encodes behavioral rules about corrections and cancellations, including:
+     - "actually", "change to", "switch to" → modify previous order rather than add.
+     - "cancel", "nevermind", "scratch that" → remove items/modifiers.
+     - Specific behavior when quantities change (don’t double-count).
+   - Defines modifier parsing rules and filler word handling.
+   - Specifies the required JSON output schema.
+   - Appends the `examples` string at the end to give the model concrete examples.
+
+Purpose:
+This cell is the heart of the instruction engineering. It tells the LLM exactly how to
+interpret orders and what JSON to output, backed by concrete training examples.
+
+
+Cell 13–14: Model Setup and LLM Call Wrapper
+-------------------------------------------
+Markdown (`### 7. Model Setup`) documents recommended provider/model combinations:
+- Cheaper models (for prompt iteration): Gemini flash variants.
+- Higher-quality models (for final submission): OpenAI and Gemini higher-tier models.
+
+Code:
+1. Configuration:
+   - `PROVIDER = "openai"`
+   - `MODEL = "gpt-4.1"`
+   - `MAX_RETRIES = 3` – how many times to retry on parse/other errors.
+   - `DELAY = 2.0` – seconds to wait between API calls to reduce rate limiting.
+
+2. Client instantiation:
+   - For Gemini: `gemini_client = genai.Client(api_key=GEMINI_KEY)`.
+   - For OpenAI: `openai_client = OpenAI(api_key=OPENAI_KEY)`.
+
+3. Function `call_llm(order_text)`:
+   - If `PROVIDER == "gemini"`:
+     - Calls `gemini_client.models.generate_content` with:
+       - `model=MODEL`.
+       - `contents = "Parse this order:\n{order_text}"`.
+       - `config` specifying `system_instruction=SYSTEM_PROMPT`, `temperature=0.0`,
+         `max_output_tokens=1024`.
+     - Returns `resp.text.strip()`.
+   - If `PROVIDER == "openai"`:
+     - Calls `openai_client.chat.completions.create` with:
+       - `model=MODEL`.
+       - `temperature=0.0`.
+       - `max_tokens=1024`.
+       - `messages` array containing a system message (the `SYSTEM_PROMPT`) and a user
+         message containing the order.
+     - Returns the first message content from `resp.choices`.
+
+4. Smoke test:
+   - Prints which provider/model is in use.
+   - Calls `call_llm("One tall latte with oat milk")` and prints the raw response to verify
+     that the prompt and connectivity are working.
+
+Purpose:
+Encapsulate the provider-specific API calls behind a single function and establish a single
+point where model, temperature, and token limits are configured.
+
+
+Cell 15–16: Parsing Orders and Batch Inference
+--------------------------------------------
+Markdown (`### 8. Parse Orders`) labels the section.
+
+Code:
+1. Function `parse_order(order_text)`:
+   - Tries up to `MAX_RETRIES` times to obtain and parse a response.
+   - Each attempt:
+     - Calls `call_llm(order_text)` to get a raw string.
+     - Strips potential Markdown fences (```json and ```).
+     - Attempts `json.loads(raw)`.
+     - Validates that both `"items"` and `"total_price"` keys exist.
+     - Passes the result through `merge_items` to collapse duplicates.
+     - Passes the merged result through `fix_price` to recompute prices.
+     - Returns the final `parsed` dict.
+   - Error handling:
+     - `json.JSONDecodeError` or `ValueError` → quick retry after a short sleep.
+     - Other exceptions:
+       - If the message suggests rate limiting (`'429'`, `'rate'`, `'quota'`), it prints a
+         message and waits for `30 * (attempt + 1)` seconds (exponential-ish backoff).
+       - Otherwise, logs the error and sleeps 5 seconds before optionally retrying.
+   - If all retries fail, returns a neutral fallback:
+     - `{"items": [], "total_price": 0.0}`.
+
+2. Batch inference over test set:
+   - Initializes `results = []` and `failed = 0`.
+   - Computes an estimated runtime in minutes: `len(test_df) * DELAY / 60`.
+   - Prints a summary line showing how many orders will be parsed and rough time estimate.
+   - Loops over `test_df.iterrows()` wrapped in `tqdm` to show a progress bar:
+     - Calls `parse_order(row['order'])` for each test order.
+     - If no items were parsed (`parsed.get('items')` is empty), increments `failed`.
+     - Appends `json.dumps(parsed)` to `results`.
+     - Sleeps for `DELAY` seconds to throttle QPS.
+   - After the loop, prints how many of the `results` ended up empty.
+
+Purpose:
+This section defines the robust, retrying parser for a single order and then applies it to
+all test orders to generate model predictions in JSON form suitable for submission.
+
+
+Cell 17–18: Generate Submission
+-------------------------------
+Markdown (`### 9. Generate Submission`) labels the section.
+
+Code:
+1. Builds `submission` DataFrame with:
+   - `id` from `test_df['id']`.
+   - `predicted_json` from the `results` list (JSON strings per order).
+
+2. Writes two CSV files:
+   - `submission_{PROVIDER}_{MODEL.replace('/', '_')}.csv` – model-specific file for tracking.
+   - `submission.csv` – a generic filename, usually the one uploaded to the competition.
+
+3. Prints `Saved: ...` and then prints the first few rows (IDs and predicted JSON) for visual
+   inspection.
+
+Purpose:
+Package the predictions into the exact format expected by the competition and provide a quick
+sanity check of a few sample outputs.
+
+
+Cell 19–20: Validation Stats and Quick Accuracy Check
+-----------------------------------------------------
+Markdown (`### 10. Validation Stats`) labels the section.
+
+Code:
+1. Aggregate statistics on predictions:
+   - `empty`: counts how many predictions have no items.
+   - `prices`: list of all positive `total_price` values.
+   - Prints:
+     - Total empty predictions and percentage.
+     - Price range (min, max), mean, and median.
+
+2. Quick training accuracy estimate:
+   - Prints a header.
+   - Sets `match = 0`, `total_checked = 0`.
+   - Samples up to 20 rows from `train_df` with `random_state=99`.
+   - For each sampled row:
+     - Parses `expected` from `expected_json`.
+     - Gets `predicted` by calling `parse_order(row['order'])` using the same pipeline used
+       for the test set.
+     - Increments `total_checked` and sleeps `DELAY` seconds (to respect rate limits).
+     - Extracts sorted item names from `expected['items']` and `predicted['items']`.
+     - Checks if item names match and prices are within 1 cent.
+       - If yes, increments `match`.
+       - Otherwise prints a "Miss" with expected vs. predicted names and prices.
+   - Prints `Quick accuracy: match/total_checked` with percentage.
+
+Purpose:
+Provide both a high-level distribution sanity check (price range, empties) and a small-sample
+accuracy check on the training data to see if the full pipeline reasonably reproduces the
+labels.
+
+
+Cell 21: Deeper Offline Structural Validation
+--------------------------------------------
+Code:
+1. Initializes `issues` dict with four categories: `name`, `size`, `modifier`, `quantity`.
+
+2. Samples 50 training rows with `random_state=42`.
+
+3. For each sampled row:
+   - Parses `expected` from `expected_json`.
+   - Runs `parse_order(row['order'])` to get `predicted`.
+   - Sleeps `DELAY` seconds (again for rate limiting).
+   - Sorts both `expected['items']` and `predicted['items']` by `name` into `exp_items` and
+     `pred_items`.
+   - If lengths differ, records a count mismatch in `issues["name"]` and continues.
+   - Otherwise, iterates pairwise (`for e, p in zip(exp_items, pred_items)`):
+     - If `e['name'] != p['name']`, records a name error.
+     - If `e['size'] != p['size']`, records a size error.
+     - If `e['quantity'] != p['quantity']`, records a quantity error.
+     - If the sorted modifier lists differ, records a modifier error.
+
+4. After all rows are processed:
+   - Prints a header and, for each category, prints the number of errors and up to the first
+     three concrete examples.
+
+Purpose:
+Go beyond a scalar accuracy metric and break down where the model is failing:
+- Are item names wrong?
+- Is the size misinterpreted?
+- Are quantities off?
+- Are modifiers being dropped or hallucinated?
+
+This helps guide further prompt tuning or menu logic adjustments.
+
+
+Summary
+-------
+In summary, the notebook:
+- Loads training/test data.
+- Encodes the menu and pricing logic in Python so that all prices are deterministic.
+- Constructs a detailed system prompt and few-shot examples to drive an LLM to parse orders
+  into JSON.
+- Provides a robust `parse_order` wrapper that handles JSON formatting quirks, retries on
+  errors, merges duplicated items, and recomputes prices.
+- Runs that parser across all test orders to generate predictions and writes a submission CSV.
+- Performs multiple levels of validation (exact price matching on training labels, quick
+  accuracy estimate, and detailed structural error breakdown on a sample) to ensure the
+  pipeline is behaving as intended.

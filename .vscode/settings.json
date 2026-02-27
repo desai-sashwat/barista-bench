@@ -1,0 +1,4 @@
+{
+  "jupyter.kernelStartupTimeout": 120,
+  "python.defaultInterpreterPath": "/opt/anaconda3/bin/python"
+}
